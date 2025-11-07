@@ -8,25 +8,29 @@ import numpy as np
 # =========================
 FOLDER = "fotos"
 EXT = ".jpeg"
-SELECCION = "imagen_17"
+SELECCION = "imagen_08"
 
 IMAGENES = {
+    #piezas con fondos blancos
     "imagen_01": "b_01",
-    "imagen_02": "b_02",
+    "imagen_02": "b_02", #0.1982
     "imagen_03": "b_03",
-    "imagen_04": "b_04",
+    "imagen_04": "b_04", # 0.2113
     "imagen_05": "b_05",
     "imagen_06": "b_06",
     "imagen_07": "b_07",
 
-    "imagen_08": "sp_01",
+    #piezas con fondos con sal y pimienta
+    "imagen_08": "sp_01", #0.1984
     "imagen_09": "sp_02",
     "imagen_10": "sp_03",
     "imagen_11": "sp_04",
-    "imagen_12": "sp_05",
+    "imagen_12": "sp_05", #0.1985
     "imagen_13": "sp_06",
     "imagen_14": "sp_07",
 
+    #piezas con fondos de alta frecuencia
+    "imagen_00": "af_00",
     "imagen_15": "af_01",
     "imagen_16": "af_02",
     "imagen_17": "af_03",
@@ -39,6 +43,7 @@ IMAGENES = {
     "imagen_24": "af_10",
     "imagen_25": "af_11",
 
+    #solo fondos (sin piezas)
     "imagen_26": "fon_AF1",
     "imagen_27": "fon_AF2",
     "imagen_28": "fon_AF3",
@@ -51,13 +56,13 @@ DEBUG = True
 
 # --- Parámetros de detección de ruido (clasificación, NO se filtra) ---
 SP_LOW, SP_HIGH = 5, 200
-SP_MIN_FRAC = 0.20
+SP_MIN_FRAC = 0.1983
 FFT_CENTER_R = 20
 FFT_K_STD = 6.0
 FFT_MIN_PIXELS = 6
 MIN_AREA_REL   = 0.001
 MAX_AREA_REL   = 0.15
-MIN_SOLIDITY   = 0.60
+MIN_SOLIDITY   = 0.75
 AREA_RATIO_MIN = 0.35
 BG_SIGMA       = 21
 
@@ -84,18 +89,6 @@ def ensure_gray(img):
 def detect_ruido(gray):
     g = gray.astype(np.uint8)
 
-    # --- Sal y pimienta: calcula y muestra frac_ext ---
-    N = g.size
-    n_low = int((g <= SP_LOW).sum())
-    n_high = int((g >= SP_HIGH).sum())
-    frac_ext = (n_low + n_high) / float(N)
-
-    print(f"[S&P] N={N}  n_low={n_low}  n_high={n_high}  "
-          f"frac_ext={frac_ext:.6f}  ({100*frac_ext:.3f}%)  umbral={SP_MIN_FRAC:.6f}")
-
-    if frac_ext >= SP_MIN_FRAC:
-        return "sal_pimienta"
-
     # --- Frecuencial (picos en FFT) ---
     f = np.fft.fft2(g)
     fshift = np.fft.fftshift(f)
@@ -109,11 +102,32 @@ def detect_ruido(gray):
     if int(np.count_nonzero(mag2 > thr)) >= FFT_MIN_PIXELS:
         return "frecuencial"
 
+    # --- Sal y pimienta: calcula y muestra frac_ext ---
+    N = g.size
+    n_low = int((g <= SP_LOW).sum())
+    n_high = int((g >= SP_HIGH).sum())
+    frac_ext = (n_low + n_high) / float(N)
+
+    corr = cv2.Laplacian(g, cv2.CV_64F).var()
+
+    print(f"[S&P] frac_ext={frac_ext:.4f}  var(Lap)={corr:.2f}")
+
+    if frac_ext >= SP_MIN_FRAC and corr > 150:
+        return "frecuencial"
+    elif frac_ext >= SP_MIN_FRAC:
+        return "sal_pimienta"
+
+    # print(f"[S&P] N={N}  n_low={n_low}  n_high={n_high}  "
+    #       f"frac_ext={frac_ext:.6f}  ({100*frac_ext:.3f}%)  umbral={SP_MIN_FRAC:.6f}")
+
+    # if frac_ext >= SP_MIN_FRAC:
+    #     return "sal_pimienta"
+
     return "limpio"
 
 
 # =========================
-# 2) Segmentación robusta (usa copias internas, no cambia tu imagen)
+# 2) Segmentación robusta (usa copias internas, no cambia la imagen)
 # =========================
 def _flatten_background(gray, sigma=BG_SIGMA):
     bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -132,7 +146,7 @@ def _clear_border(mask):
 def _filtrar_componentes(labels, stats, cents, shape):
     h, w = shape
     img_area = h * w
-    min_area = max(300, int(MIN_AREA_REL * img_area))
+    min_area = max(300, int(MIN_AREA_REL * img_area)) 
     max_area = int(MAX_AREA_REL * img_area)
 
     candidatos = []
@@ -222,8 +236,8 @@ def main():
         print("No se detectaron piezas.")
 
     if DEBUG:
-        cv2.imshow("Entrada (gris 800x600) — SIN modificar", gray)
-        cv2.imshow("Máscara (piezas)", mask)
+        cv2.imshow("Entrada (gris 800x600) SIN modificar", gray)
+        cv2.imshow("Mascara (piezas)", mask)
         cv2.imshow("Resultado", dibujar(gray, piezas))
         cv2.waitKey(0); cv2.destroyAllWindows()
 
