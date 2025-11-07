@@ -8,7 +8,7 @@ import numpy as np
 # =========================
 FOLDER = "fotos"
 EXT = ".jpeg"
-SELECCION = "imagen_08"
+SELECCION = "imagen_09"
 
 IMAGENES = {
     #piezas con fondos blancos
@@ -87,6 +87,9 @@ def ensure_gray(img):
 # 1) Clasificación de ruido (sin modificar imagen)
 # =========================
 def detect_ruido(gray):
+    A=0 #indicador de que tipo de ruido // A=0 limpio
+    #A=1 #sal y pimienta
+    #A=2 #frecuencial
     g = gray.astype(np.uint8)
 
     # --- Frecuencial (picos en FFT) ---
@@ -100,7 +103,9 @@ def detect_ruido(gray):
     mag2 = mag.copy(); mag2[mask_centro] = mag2.mean()
     thr = mag2.mean() + FFT_K_STD * mag2.std()
     if int(np.count_nonzero(mag2 > thr)) >= FFT_MIN_PIXELS:
-        return "frecuencial"
+        A=2
+        print("Ruido tipo: Frecuencial")
+        return A
 
     # --- Sal y pimienta: calcula y muestra frac_ext ---
     N = g.size
@@ -113,17 +118,40 @@ def detect_ruido(gray):
     print(f"[S&P] frac_ext={frac_ext:.4f}  var(Lap)={corr:.2f}")
 
     if frac_ext >= SP_MIN_FRAC and corr > 150:
-        return "frecuencial"
+        A=2
+        print("Ruido tipo: Frecuencial")
+        return A
     elif frac_ext >= SP_MIN_FRAC:
-        return "sal_pimienta"
+        A=1
+        print("Ruido tipo: Sal y pimienta")
+        return A
 
-    # print(f"[S&P] N={N}  n_low={n_low}  n_high={n_high}  "
-    #       f"frac_ext={frac_ext:.6f}  ({100*frac_ext:.3f}%)  umbral={SP_MIN_FRAC:.6f}")
+    print("Limpio")
+    return A
+# =========================
+# Eliminación de ruido
+# =========================
+def eliminar_ruido(gray, tipo):
+    denoised = gray.copy()
+    if tipo == 1:  # Sal y pimienta
+        denoised = cv2.medianBlur(denoised, 3)
+    elif tipo == 2:  # Frecuencial
+        f = np.fft.fft2(denoised)
+        fshift = np.fft.fftshift(f)
+        h, w = denoised.shape
+        cy, cx = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        mask_centro = (yy - cy)**2 + (xx - cx)**2 <= FFT_CENTER_R**2
+        mag = np.log1p(np.abs(fshift)).astype(np.float32)
+        mag2 = mag.copy(); mag2[mask_centro] = mag2.mean()
+        thr = mag2.mean() + FFT_K_STD * mag2.std()
+        fshift_denoised = fshift.copy()
+        fshift_denoised[mag2 > thr] = 0
+        f_ishift = np.fft.ifftshift(fshift_denoised)
+        denoised = np.fft.ifft2(f_ishift).real
+        denoised = np.clip(denoised, 0, 255).astype(np.uint8)
+    return denoised
 
-    # if frac_ext >= SP_MIN_FRAC:
-    #     return "sal_pimienta"
-
-    return "limpio"
 
 
 # =========================
@@ -219,13 +247,15 @@ def main():
     gray = ensure_gray(img)
     gray = resize_to_target(gray, TARGET_W, TARGET_H)
 
-    # 1) Solo CLASIFICAMOS el ruido (NO se filtra)
+    # 1) Solo CLASIFICAMOS el ruido
     tipo = detect_ruido(gray)
-    print(f"Ruido clasificado: {tipo}")
+    eliminar_ruido(gray, tipo)
     #print(f"fracción sp: {np.mean(gray <= SP_LOW) + np.mean(gray >= SP_HIGH):.4f}")
 
     # 2) Segmentamos usando una copia interna, pero mostramos sobre la imagen original
     piezas, mask = segmentar_y_encontrar(gray)
+
+    
 
     if len(piezas) >= 2:
         print(f'{piezas[0]["id"]}: centro = {piezas[0]["centro"]}')

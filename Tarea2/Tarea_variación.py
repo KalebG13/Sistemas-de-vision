@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import cv2
 import numpy as np
@@ -8,9 +7,10 @@ import numpy as np
 # =========================
 FOLDER = "fotos"
 EXT = ".jpeg"
-SELECCION = "imagen_09"
+SELECCION = "imagen_00"
 
 IMAGENES = {
+    # piezas con fondos blancos
     "imagen_01": "b_01",
     "imagen_02": "b_02",
     "imagen_03": "b_03",
@@ -19,6 +19,7 @@ IMAGENES = {
     "imagen_06": "b_06",
     "imagen_07": "b_07",
 
+    # piezas con fondos con sal y pimienta
     "imagen_08": "sp_01",
     "imagen_09": "sp_02",
     "imagen_10": "sp_03",
@@ -27,6 +28,8 @@ IMAGENES = {
     "imagen_13": "sp_06",
     "imagen_14": "sp_07",
 
+    # piezas con fondos de alta frecuencia
+    "imagen_00": "af_00",
     "imagen_15": "af_01",
     "imagen_16": "af_02",
     "imagen_17": "af_03",
@@ -39,6 +42,7 @@ IMAGENES = {
     "imagen_24": "af_10",
     "imagen_25": "af_11",
 
+    # solo fondos (sin piezas)
     "imagen_26": "fon_AF1",
     "imagen_27": "fon_AF2",
     "imagen_28": "fon_AF3",
@@ -49,26 +53,31 @@ IMAGENES = {
 TARGET_W, TARGET_H = 800, 600
 DEBUG = True
 
-# --- Detección ADAPTATIVA de Sal-y-Pimienta (ajústalos si hace falta) ---
-SP_P_LOW = 1       # percentil bajo de brillo para "extremos"
-SP_P_HIGH = 99     # percentil alto
-SP_K_MAD = 4.0       # k * MAD sobre el residuo
-SP_MAX_CC_AREA = 10  # área máx. (px) de un impulso
-SP_FRAC_MIN = 0.01  # fracción absoluta mínima (0.5%)
-SP_MULT_BASE = 3.0   # veces por encima de la cola base del residuo para activar
-PRINT_SP_DEBUG = False  # True para ver métricas y calibrar
+# --- Parámetros de detección de ruido ---
+SP_LOW, SP_HIGH = 5, 200
+SP_MIN_FRAC = 0.1983
 
-# --- FFT (ruido frecuencial) ---
 FFT_CENTER_R = 20
-FFT_K_STD = 6.0
-FFT_MIN_PIXELS = 6
+FFT_K_STD = 3
+FFT_MIN_PIXELS = 1
 
-# --- Segmentación robusta ---
-MIN_AREA_REL   = 0.001
-MAX_AREA_REL   = 0.15
-MIN_SOLIDITY   = 0.60
+# --- Parámetros de segmentación / piezas ---
+# AHORA: umbrales DIRECTOS de área en píxeles
+# Si quieres detectar piezas más pequeñas -> baja MIN_AREA_PX
+# Si quieres que ignore cosas grandes -> baja MAX_AREA_PX
+MIN_AREA_PX = 5000     # área mínima de una pieza
+MAX_AREA_PX = 23000  # área máxima de una pieza
+
+MIN_SOLIDITY   = 0.4
 AREA_RATIO_MIN = 0.35
 BG_SIGMA       = 21
+
+# filtros geométricos para descartar barras finas/alargadas
+AR_MAX   = 20   # máximo aspect ratio permitido (lado_largo / lado_corto)
+MIN_SIDE = 25   # lado mínimo en píxeles para considerar una pieza
+
+DEBUG_AREAS = False    # pon True si quieres ver áreas de todos los blobs
+
 
 # =========================
 # Utils
@@ -87,83 +96,99 @@ def ensure_gray(img):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img
 
+
 # =========================
 # 1) Clasificación de ruido (sin modificar imagen)
 # =========================
-def _salt_pepper_adapt(gray):
-    """
-    Devuelve (is_sp, stats) usando un criterio ADAPTATIVO:
-    - Residuo por mediana 3x3 (impulsos)
-    - Umbral robusto con MAD
-    - Cuenta solo extremos (percentiles) y componentes diminutas
-    - Compara contra la 'cola' base del residuo para decidir
-    """
-    g = gray.astype(np.uint8)
-
-    # Residuo impulsivo con mediana 3x3
-    m3 = cv2.medianBlur(g, 3)
-    r = cv2.absdiff(g, m3).astype(np.float32)
-
-    # Umbral robusto del residuo: mediana + k * MAD
-    med_r = np.median(r)
-    mad_r = np.median(np.abs(r - med_r)) + 1e-6
-    thr_r = med_r + SP_K_MAD * 1.4826 * mad_r
-
-    # Extremos por percentiles (adaptativos a iluminación)
-    low = np.percentile(g, SP_P_LOW)
-    high = np.percentile(g, SP_P_HIGH)
-    extremes = (g <= low + 2) | (g >= high - 2)
-
-    # Impulsos = residuo alto Y extremo
-    impulses = (r > thr_r) & extremes
-    imp_u8 = (impulses.astype(np.uint8) * 255)
-
-    # Mantener solo componentes diminutas
-    n, lab, stats, _ = cv2.connectedComponentsWithStats(imp_u8, connectivity=8)
-    small_mask = np.zeros_like(imp_u8)
-    for i in range(1, n):
-        if stats[i, -1] <= SP_MAX_CC_AREA:
-            small_mask[lab == i] = 255
-
-    frac_imp = small_mask.mean() / 255.0   # fracción de impulsos
-
-    # Cola base del residuo (sin exigir extremos)
-    tail = float((r > thr_r).mean())
-
-    # Decisión final
-    thr_frac = max(SP_FRAC_MIN, SP_MULT_BASE * tail)
-    is_sp = frac_imp >= thr_frac
-
-    stats_out = {"frac_imp": frac_imp, "tail": tail, "thr_frac": thr_frac,
-                 "thr_r": float(thr_r), "low": float(low), "high": float(high)}
-    return is_sp, stats_out
-
 def detect_ruido(gray):
-    # 1) Sal y pimienta ADAPTATIVO
-    is_sp, sp_stats = _salt_pepper_adapt(gray)
-    if PRINT_SP_DEBUG:
-        print(f"[SP] frac_imp={sp_stats['frac_imp']:.4f}  tail={sp_stats['tail']:.4f}  thr_frac={sp_stats['thr_frac']:.4f}")
-    if is_sp:
-        return "sal_pimienta"
-
-    # 2) Frecuencial (picos en FFT)
+    # 0: limpio, 1: sal y pimienta, 2: frecuencial
     g = gray.astype(np.uint8)
+
+    # --- Métricas para sal y pimienta ---
+    N = g.size
+    n_low  = int((g <= SP_LOW).sum())
+    n_high = int((g >= SP_HIGH).sum())
+    frac_ext = (n_low + n_high) / float(N)
+
+    corr = cv2.Laplacian(g, cv2.CV_64F).var()
+
+    print(f"[S&P] frac_ext={frac_ext:.4f}  var(Lap)={corr:.2f}")
+
+    LAP_MAX_VAR_SP = 150  # ajustable
+
+    if frac_ext >= SP_MIN_FRAC and corr < LAP_MAX_VAR_SP:
+        print("Ruido tipo: Sal y pimienta")
+        return 1
+
+    # --- Métricas para ruido frecuencial (picos en FFT) ---
     f = np.fft.fft2(g)
     fshift = np.fft.fftshift(f)
     mag = np.log1p(np.abs(fshift)).astype(np.float32)
+
     h, w = mag.shape
     cy, cx = h // 2, w // 2
     yy, xx = np.ogrid[:h, :w]
     mask_centro = (yy - cy)**2 + (xx - cx)**2 <= FFT_CENTER_R**2
-    mag2 = mag.copy(); mag2[mask_centro] = mag2.mean()
-    thr = mag2.mean() + FFT_K_STD * mag2.std()
-    if int(np.count_nonzero(mag2 > thr)) >= FFT_MIN_PIXELS:
-        return "frecuencial"
 
-    return "limpio"
+    mag2 = mag.copy()
+    mag2[mask_centro] = mag2.mean()
+
+    thr = mag2.mean() + FFT_K_STD * mag2.std()
+    n_peaks = int(np.count_nonzero(mag2 > thr))
+
+    print(f"[FFT] n_peaks={n_peaks}")
+
+    if n_peaks >= FFT_MIN_PIXELS:
+        print("Ruido tipo: Frecuencial")
+        return 2
+
+    print("Limpio")
+    return 0
+
 
 # =========================
-# 2) Segmentación robusta (usa copias internas, no cambia tu imagen)
+# 2) Eliminación de ruido
+# =========================
+def eliminar_ruido(gray, tipo):
+    denoised = gray.copy()
+
+    if tipo == 1:   # Sal y pimienta (lo dejas como ya lo tenías)
+        denoised = cv2.medianBlur(denoised, 3)
+        denoised = cv2.medianBlur(denoised, 5)
+
+    elif tipo == 2:  # Alta frecuencia: low-pass gaussiano FUERTE
+        g = gray.astype(np.float32)
+
+        # FFT
+        f = np.fft.fft2(g)
+        fshift = np.fft.fftshift(f)
+
+        h, w = g.shape
+        cy, cx = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        r2 = (yy - cy)**2 + (xx - cx)**2
+
+         # sigma pequeño => filtrado más fuerte (más borroso)
+        SIGMA_LP = 0.006 * min(h, w)   # prueba 0.05, 0.07, 0.1, etc.
+        H = np.exp(-r2 / (2.0 * SIGMA_LP * SIGMA_LP))
+        # ------------------------------------------------------
+
+        fshift_filt = fshift * H
+
+        # Volver al dominio espacial
+        f_ishift = np.fft.ifftshift(fshift_filt)
+        img_back = np.fft.ifft2(f_ishift).real
+        denoised = np.clip(img_back, 0, 255).astype(np.uint8)
+
+        # Opcional: un poco más de suavizado si aún ves patrón
+        # denoised = cv2.GaussianBlur(denoised, (5, 5), 0)
+
+    return denoised
+
+
+
+# =========================
+# 3) Segmentación robusta
 # =========================
 def _flatten_background(gray, sigma=BG_SIGMA):
     bg = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -173,7 +198,9 @@ def _flatten_background(gray, sigma=BG_SIGMA):
 def _clear_border(mask):
     h, w = mask.shape
     n, labels = cv2.connectedComponents(mask)
-    border_labels = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
+    border_labels = np.unique(
+        np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+    )
     out = mask.copy()
     for bl in border_labels:
         out[labels == bl] = 0
@@ -181,32 +208,56 @@ def _clear_border(mask):
 
 def _filtrar_componentes(labels, stats, cents, shape):
     h, w = shape
-    img_area = h * w
-    min_area = max(300, int(MIN_AREA_REL * img_area))
-    max_area = int(MAX_AREA_REL * img_area)
 
     candidatos = []
     for lab in range(1, stats.shape[0]):
         x, y, ww, hh, area = stats[lab, 0], stats[lab, 1], stats[lab, 2], stats[lab, 3], stats[lab, -1]
-        if area < min_area or area > max_area:  continue
-        if x == 0 or y == 0 or (x + ww) >= w or (y + hh) >= h:  continue
 
+        # 1) Filtro por área absoluta
+        if area < MIN_AREA_PX or area > MAX_AREA_PX:
+            continue
+
+        # 2) No tocar bordes
+        if x == 0 or y == 0 or (x + ww) >= w or (y + hh) >= h:
+            continue
+
+        # 3) Filtro geométrico básico
+        side_min = min(ww, hh)
+        side_max = max(ww, hh)
+        aspect   = side_max / (side_min + 1e-6)
+
+        if side_min < MIN_SIDE:
+            continue
+        if aspect > AR_MAX:
+            continue
+
+        # 4) Solidity (más relajado)
         mask_i = (labels == lab).astype(np.uint8) * 255
         cnts, _ = cv2.findContours(mask_i, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:  continue
+        if not cnts:
+            continue
         cnt = max(cnts, key=cv2.contourArea)
         hull = cv2.convexHull(cnt)
         hull_area = max(1.0, cv2.contourArea(hull))
         solidity = area / hull_area
-        if solidity < MIN_SOLIDITY:  continue
+        if solidity < MIN_SOLIDITY:
+            continue
 
         cx, cy = map(int, cents[lab])
-        candidatos.append({"lab": lab, "area": int(area), "centro": (cx, cy), "bbox": (int(x), int(y), int(ww), int(hh))})
+        candidatos.append({
+            "lab": lab,
+            "area": int(area),
+            "centro": (cx, cy),
+            "bbox": (int(x), int(y), int(ww), int(hh))
+        })
 
     candidatos.sort(key=lambda p: p["area"], reverse=True)
+
     if len(candidatos) >= 2 and candidatos[1]["area"] < AREA_RATIO_MIN * candidatos[0]["area"]:
         candidatos = candidatos[:1]
+
     return candidatos[:2]
+
 
 def segmentar_y_encontrar(gray):
     flat = _flatten_background(gray, sigma=BG_SIGMA)
@@ -214,8 +265,13 @@ def segmentar_y_encontrar(gray):
     eq = clahe.apply(flat)
 
     invert = eq.mean() < 127
-    _, th = cv2.threshold(eq, 0, 255,
-                          (cv2.THRESH_BINARY_INV if not invert else cv2.THRESH_BINARY) + cv2.THRESH_OTSU)
+    _, th = cv2.threshold(
+        eq,
+        0,
+        255,
+        (cv2.THRESH_BINARY_INV if not invert else cv2.THRESH_BINARY) + cv2.THRESH_OTSU
+    )
+
     th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
     th = _clear_border(th)
@@ -228,38 +284,66 @@ def segmentar_y_encontrar(gray):
 
     piezas_fmt = []
     for i, p in enumerate(piezas, 1):
-        piezas_fmt.append({"id": f"pieza_{i}", "centro": p["centro"], "bbox": p["bbox"], "area": p["area"]})
+        piezas_fmt.append({
+            "id": f"pieza_{i}",
+            "centro": p["centro"],
+            "bbox": p["bbox"],
+            "area": p["area"]
+        })
     return piezas_fmt, mask_two
 
 def dibujar(gray, piezas):
     out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for p in piezas:
-        (x, y, w, h) = p["bbox"]; (cx, cy) = p["centro"]
-        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        (x, y, w, h) = p["bbox"]
+        (cx, cy) = p["centro"]
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.circle(out, (cx, cy), 6, (0, 0, 255), -1)
-        cv2.putText(out, f'{p["id"]} ({cx},{cy})', (x, max(15, y-6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            out,
+            f'{p["id"]} ({cx},{cy})',
+            (x, max(15, y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
     return out
 
+
 # =========================
-# 3) MAIN
+# 4) MAIN
 # =========================
 def main():
     ruta = build_path(SELECCION)
     if not os.path.exists(ruta):
         raise FileNotFoundError(f"No se encontró la imagen: {ruta}")
+
     img = cv2.imread(ruta, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"No se pudo leer '{ruta}'.")
+
     gray = ensure_gray(img)
     gray = resize_to_target(gray, TARGET_W, TARGET_H)
 
-    # 1) Solo CLASIFICAMOS el ruido (NO se filtra)
-    tipo = detect_ruido(gray)
-    print(f"Ruido clasificado: {tipo}")
+    gray_ruidosa = gray.copy()
 
-    # 2) Segmentación (se calcula en copias internas); se dibuja sobre la imagen original
-    piezas, mask = segmentar_y_encontrar(gray)
+    tipo = detect_ruido(gray)
+
+    if tipo == 2:  # alta frecuencia
+        piezas, mask = segmentar_y_encontrar(gray)
+        fondo_filtrado = eliminar_ruido(gray, 2)
+        gray_limpia = gray.copy()
+        gray_limpia[mask == 0] = fondo_filtrado[mask == 0]
+
+    elif tipo == 1:  # sal y pimienta
+        gray_limpia = eliminar_ruido(gray, 1)
+        piezas, mask = segmentar_y_encontrar(gray_limpia)
+
+    else:  # limpio
+        gray_limpia = gray
+        piezas, mask = segmentar_y_encontrar(gray_limpia)
 
     if len(piezas) >= 2:
         print(f'{piezas[0]["id"]}: centro = {piezas[0]["centro"]}')
@@ -270,10 +354,12 @@ def main():
         print("No se detectaron piezas.")
 
     if DEBUG:
-        cv2.imshow("Entrada (gris 800x600) — SIN modificar", gray)
-        cv2.imshow("Máscara (piezas)", mask)
-        cv2.imshow("Resultado", dibujar(gray, piezas))
-        cv2.waitKey(0); cv2.destroyAllWindows()
+        cv2.imshow("Entrada ruidosa (gris 800x600)", gray_ruidosa)
+        cv2.imshow("Entrada filtrada", gray_limpia)
+        cv2.imshow("Mascara (piezas)", mask)
+        cv2.imshow("Resultado", dibujar(gray_limpia, piezas))
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
